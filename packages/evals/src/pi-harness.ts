@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { contentText } from "@earendil-works/pi-ai";
 import {
@@ -36,6 +36,15 @@ type PiCodingAgentHarnessOptions = {
 	name?: string;
 	model?: PiCodingAgentModelSelection;
 	noTools?: CreateAgentSessionOptions["noTools"];
+	tools?: CreateAgentSessionOptions["tools"];
+	excludeTools?: CreateAgentSessionOptions["excludeTools"];
+	thinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
+	settings?: Parameters<typeof SettingsManager.inMemory>[0];
+	maxTurns?: number;
+	toolExecution?: "parallel" | "sequential";
+	/** Optional externally prepared workspace. When provided, the harness uses it as-is
+	 *  (it must already exist) and never deletes it; the caller owns preparation and cleanup. */
+	workspace?: string;
 	transformSystemPrompt?: (defaultPrompt: string) => string;
 };
 
@@ -53,6 +62,19 @@ export function resolveModelSelection(
 		throw new Error("Select a harness model explicitly or set both PI_PROVIDER and PI_MODEL as defaults.");
 	}
 	return { provider, id };
+}
+
+/**
+ * Turn-limit guard for the agent loop's `shouldStopAfterTurn` hook.
+ * The guard returns false for the first `maxTurns - 1` turns and true on the
+ * `maxTurns`-th turn, so the agent runs at most `maxTurns` turns.
+ */
+export function createTurnLimitGuard(maxTurns: number): () => boolean {
+	if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) {
+		throw new Error("maxTurns must be a positive integer.");
+	}
+	let turns = 0;
+	return () => ++turns >= maxTurns;
 }
 
 function toTranscriptEvents(messages: AgentSession["messages"]): TranscriptEvent[] {
@@ -120,19 +142,24 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 	if (!model) throw new Error(`Eval model not found: ${selection.provider}/${selection.id}`);
 
 	const root = await mkdtemp(join(tmpdir(), "pi-eval-"));
-	const cwd = join(root, "workspace");
+	const cwd = options.workspace ? resolve(options.workspace) : join(root, "workspace");
 	const agentDir = join(root, "agent");
 	let transformedSystemPrompt: string | undefined;
 	let sessionManager: SessionManager | undefined;
 	let session: AgentSession | undefined;
 	let outcome: { success: true; result: SimpleHarnessResult<string | TOutput> } | { success: false; error: unknown };
 	try {
-		await Promise.all([mkdir(cwd), mkdir(agentDir)]);
+		if (options.workspace) {
+			if (!existsSync(cwd)) throw new Error(`Eval workspace does not exist: ${cwd}`);
+			await mkdir(agentDir);
+		} else {
+			await Promise.all([mkdir(cwd), mkdir(agentDir)]);
+		}
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
 			modelRuntime,
-			settingsManager: SettingsManager.inMemory(),
+			settingsManager: SettingsManager.inMemory(options.settings ?? {}),
 			...(options.transformSystemPrompt
 				? { resourceLoaderOptions: { systemPromptOverride: () => transformedSystemPrompt } }
 				: {}),
@@ -145,10 +172,18 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 				services,
 				sessionManager,
 				model,
-				thinkingLevel: "off",
+				thinkingLevel: options.thinkingLevel ?? "off",
 				noTools: options.noTools,
+				tools: options.tools,
+				excludeTools: options.excludeTools,
 			})
 		).session;
+		if (options.maxTurns !== undefined) {
+			session.agent.shouldStopAfterTurn = createTurnLimitGuard(options.maxTurns);
+		}
+		if (options.toolExecution !== undefined) {
+			session.agent.toolExecution = options.toolExecution;
+		}
 
 		const evalSession = session;
 		if (options.transformSystemPrompt) {
