@@ -45,6 +45,9 @@ type PiCodingAgentHarnessOptions = {
 	/** Optional externally prepared workspace. When provided, the harness uses it as-is
 	 *  (it must already exist) and never deletes it; the caller owns preparation and cleanup. */
 	workspace?: string;
+	/** Accept runs that end mid-turn (e.g. a maxTurns cutoff leaving a tool-call stop
+	 *  reason) instead of failing them. The final text may be empty. */
+	acceptIncomplete?: boolean;
 	transformSystemPrompt?: (defaultPrompt: string) => string;
 };
 
@@ -109,7 +112,12 @@ function toTranscriptEvents(messages: AgentSession["messages"]): TranscriptEvent
 	return events;
 }
 
-async function promptAgent(session: AgentSession, input: string, signal: AbortSignal | undefined): Promise<string> {
+async function promptAgent(
+	session: AgentSession,
+	input: string,
+	signal: AbortSignal | undefined,
+	acceptIncomplete: boolean | undefined,
+): Promise<string> {
 	signal?.throwIfAborted();
 	const previousMessageCount = session.messages.length;
 	await session.prompt(input);
@@ -118,13 +126,13 @@ async function promptAgent(session: AgentSession, input: string, signal: AbortSi
 		.reverse()
 		.find((message) => message.role === "assistant");
 	if (!assistant) throw new Error("Agent run completed without an assistant message.");
-	if (assistant.stopReason !== "stop") {
+	if (assistant.stopReason !== "stop" && !(acceptIncomplete && assistant.stopReason === "toolUse")) {
 		throw new Error(
 			assistant.errorMessage ?? `Agent run ended with unexpected stop reason: ${assistant.stopReason}.`,
 		);
 	}
-	const output = session.getLastAssistantText();
-	if (!output) throw new Error("Agent run produced no assistant text.");
+	const output = session.getLastAssistantText() ?? "";
+	if (!output && !acceptIncomplete) throw new Error("Agent run produced no assistant text.");
 	return output;
 }
 
@@ -205,7 +213,7 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 			let response: string | undefined;
 			for (const step of steps) {
 				if (step.type === "prompt") {
-					response = await promptAgent(evalSession, step.content, signal);
+					response = await promptAgent(evalSession, step.content, signal, options.acceptIncomplete);
 				} else {
 					await evalSession.reload();
 				}
