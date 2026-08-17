@@ -17,12 +17,20 @@ const instancesJson = JSON.parse(
 	readFileSync(new URL("./instances.json", import.meta.url), "utf8"),
 ) as { instances: SweInstance[] };
 
-// Optional single-instance filter for local debugging:
-//   PI_SWE_INSTANCE=pallets__flask-5063 npm run eval -- src/swe-bench/runner.eval.ts
+// Optional instance filter (comma-separated) for local debugging or subsets:
+//   PI_SWE_INSTANCE=pallets__flask-5063,django__django-11620 npm run eval -- src/swe-bench/runner.eval.ts
 const instanceFilter = process.env.PI_SWE_INSTANCE?.trim();
-const instances = instanceFilter
-	? instancesJson.instances.filter((inst) => inst.instance_id === instanceFilter)
+const instanceIds = instanceFilter
+	? new Set(instanceFilter.split(",").map((s) => s.trim()))
+	: undefined;
+const instances = instanceIds
+	? instancesJson.instances.filter((inst) => instanceIds.has(inst.instance_id))
 	: instancesJson.instances;
+
+// Optional turn limit; unset runs without a turn cap:
+//   PI_SWE_MAX_TURNS=20 npm run eval -- src/swe-bench/runner.eval.ts
+const maxTurnsEnv = process.env.PI_SWE_MAX_TURNS?.trim();
+const maxTurns = maxTurnsEnv ? Number(maxTurnsEnv) : undefined;
 
 const REPO_CACHE = resolve(
 	process.env.PI_SWE_REPO_CACHE ?? join(process.env.HOME ?? "", "pi-eval-data", "swe-repos"),
@@ -78,7 +86,7 @@ for (const inst of instances) {
 	const workspace = createWorkspace(inst.repo, inst.base_commit);
 	const harness = createPiCodingAgentHarness({
 		workspace,
-		maxTurns: 20,
+		...(maxTurns !== undefined ? { maxTurns } : {}),
 		acceptIncomplete: true,
 		output: () => {
 			git(["add", "-A"], workspace);
